@@ -1,0 +1,585 @@
+---
+title: "unsp_dataprep"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = F, message = F, comment = F, warning =F)
+```
+
+
+```{r, message = F, comment = F}
+library(tidyverse)
+library(lme4)
+library(broom)
+library(texreg)
+library(ggridges)
+library(readxl)
+library(countrycode)
+library(readstata13)
+
+```
+
+
+```{r}
+# reading the data
+rm(list = ls())
+data <- read_excel("./UNSpecialProcedures_Communications_retrieved05.05.2023.xlsx")
+
+# keep only columns with data
+names(data)
+data <- dplyr::select(data, Date, Country, Type, `Ref. no.`, Mandates, Summary, `UN Region`, 
+               `OHCHR Region`, `Nb. of alleged victims`, `Nb. of replies`, Replies, Replies2,
+               Replies3, Replies4, Replies5, Replies6, Replies7, Replies8, Replies9, Replies10,
+               Replies11, Replies12, Replies13, Replies14, Replies15, Replies16, Replies17)
+
+```
+
+```{r}
+#### Filter only Communications to countries (exclude companies, organizations, individuals) ####
+
+# Add countrycodes 
+data$cowc <- countrycode(data$Country, "country.name", "cowc") 
+
+# Check cases where it did not work
+cowc_fails <- filter(data, is.na(cowc))
+unique(cowc_fails$Country)
+
+# Manually code countries that were not recognized
+data$cowc <- ifelse(data$Country == "Serbia", "YUG", data$cowc)
+data$cowc <- ifelse(data$Country == "Türkiye", "TUR", data$cowc)
+
+# Filter only Communications to countries
+data <- filter(data, !is.na(cowc))
+
+# Retrieve year-variable
+data <- rename(data, ref_no = `Ref. no.`)
+data$year <- sub(".*/", "",data$ref_no)
+data$year <- as.numeric(data$year)
+
+# Create cowc_year variables
+data$cowc_year <- paste(data$cowc, "_", data$year)
+
+```
+
+```{r}
+#### Filter only Other Letters ####
+
+# Check types of Communications
+table(data$Type)
+
+# Filter Other letters
+otherletters <- filter(data, Type %in% c("OL", "JOL"))
+##write.csv2(otherletters, "otherletters.csv")
+#otherletters$physint <- str_detect(otherletters$Mandates, "detention|disappearances|executions|torture")
+#otherletters$physint <- ifelse(otherletters$physint == TRUE, 1, 0)
+#physint_ols <- filter(otherletters, physint == 1)
+#physint_ols$replied <- ifelse(physint_ols$`Nb. of replies` > 0, 1, 0)
+#write.csv2(physint_ols, "otherletters_physint.csv")
+
+# Take random sample of 250 OLs
+#random_sample <- sample_n(otherletters, 250, replace = F)
+#write.csv2(random_sample, "random_sample.csv")
+
+# Create country_year level dataset with all Other Letters
+cydata <- otherletters %>% group_by(cowc_year) %>% count()
+cydata$year <- sub(".*_","",cydata$cowc_year)
+cydata$year <- as.numeric(cydata$year)
+cydata$cowc <- sub("_.*","",cydata$cowc_year)
+
+# Rename Other Letter variable
+cydata <- cydata %>% rename(other_letters = n) %>% arrange(cowc, year) %>% 
+  relocate(cowc, year, other_letters, cowc_year)
+unique(cydata$year) # Other Letters since 2016 and until 2023 available
+
+# Check country ranking 
+countrydata <- otherletters %>% group_by(Country) %>% count() %>% rename(num_OLs = n) %>% 
+  arrange(desc(num_OLs))
+```
+
+
+```{r}
+#### Add data on Other Letters to Country-Year panel ####
+
+# Get complete panel of countrycodes
+fullcountries <- read_csv("./COW-countrycodes.csv")
+
+# Rename vars
+fullcountries <- fullcountries %>% rename(country = StateNme, cowc = StateAbb, cown = CCode)
+
+# Create panel
+countryyear_panel <- fullcountries %>% 
+  rowwise() %>% 
+  mutate(year = list(2010:2023))  %>% 
+  unnest(cols = c(year)) 
+
+# Create unique identifiers
+countryyear_panel$cowc_year <- paste(countryyear_panel$cowc, "_", countryyear_panel$year)
+
+# Remove duplicates
+table(duplicated(countryyear_panel$cowc_year))
+countryyear_panel <- countryyear_panel[!duplicated(countryyear_panel$cowc_year), ]
+
+# Keep only relevant variables
+countryyear_panel <- dplyr::select(countryyear_panel, cowc_year, cowc, year, cown, country)
+
+# Check whether all observations merge
+mergefails <- anti_join(cydata, countryyear_panel, by = "cowc_year") # all merge
+
+# Left join cydata to country-year panel
+cydata <- dplyr::select(cydata, cowc_year, other_letters)
+cypanel <- left_join(countryyear_panel, cydata, by = "cowc_year")
+
+# Replace NAs with 0 as NAs indicate that no Other Letters were received
+cypanel$other_letters <- ifelse(is.na(cypanel$other_letters), 0 , cypanel$other_letters)
+table(duplicated(cypanel$cowc_year))
+
+```
+
+
+```{r}
+#### Add variable of number of replies to Other Letters ####
+
+# Check number of replies
+data <- rename(data, num_replies = `Nb. of replies`)
+data$replied <- ifelse(data$num_replies > 0, 1, 0)
+
+# Create sub-dataset that includes only Communications were replies took place
+data_onlyreply <- filter(data, replied == 1)
+
+# Focus only on Other Letters
+data_replied_otherletters <- filter(data_onlyreply, Type %in% c("OL", "JOL"))
+#write.csv2(data_replied_otherletters, "replied_otherletters.csv")
+
+# Create country_year level dataset
+cydata2 <- data_replied_otherletters %>% group_by(cowc_year) %>% count()
+
+# Rename replies variable
+cydata2 <- rename(cydata2, replied = n)
+
+# Left joint to Country-Year Panel
+cypanel <- left_join(cypanel, cydata2, by = "cowc_year")
+
+# Rename missings in replied variable
+cypanel$replied <- ifelse(is.na(cypanel$replied), 0, cypanel$replied)
+
+```
+
+```{r}
+#### Create binary variables for type of mandates ####
+unique(otherletters$Mandates)
+
+# Create binary for ecosco rights
+otherletters$ecosoc <- str_detect(otherletters$Mandates, "business|development|food|debt|housing|poverty")
+otherletters$ecosoc <- ifelse(otherletters$ecosoc == TRUE, 1, 0)
+
+# Create binary for civil-political rights
+otherletters$civpol <- str_detect(otherletters$Mandates, "detention|disappearances|executions|opinion|assembly|defenders|judges|democratic|privacy|belief|freedoms|torture|violence")
+otherletters$civpol <- ifelse(otherletters$civpol == TRUE, 1, 0)
+
+# Create binary for physical integrity rights
+otherletters$physint <- str_detect(otherletters$Mandates, "detention|disappearances|executions|torture")
+otherletters$physint <- ifelse(otherletters$physint == TRUE, 1, 0)
+
+# Create binary for environment-related rights
+otherletters$environ <- str_detect(otherletters$Mandates, "climate|environment|water")
+otherletters$environ <- ifelse(otherletters$environ == TRUE, 1, 0)
+
+# Create binary for OL focused on Freedom of Expression and Opinion
+otherletters$opinion <- str_detect(otherletters$Mandates, "opinion")
+otherletters$opinion <- ifelse(otherletters$opinion == TRUE, 1, 0)
+opinion_ols <- filter(otherletters, opinion > 0)
+#write.csv2(opinion_ols, "opinion_ols.csv")
+#opinion_replied <- opinion_ols %>% filter(`Nb. of replies` > 0) %>% select(Date, Country, ref_no)
+#write.csv2(opinion_replied, "opinion_replied.csv")
+
+```
+
+```{r}
+
+#### Add mandate-specific variables to country-year dataset ####
+
+# Create sub-dataset that includes only OLs from given mandates
+data_onlyecosoc <- filter(otherletters, ecosoc == 1)
+data_onlycivpol <- filter(otherletters, civpol == 1)
+data_onlyenviron <- filter(otherletters, environ == 1)
+data_onlyphysint <- filter(otherletters, physint == 1)
+data_onlyopinion <- filter(otherletters, opinion == 1)
+
+# Create country_year level datasets
+cydata_ecosoc <- data_onlyecosoc %>% group_by(cowc_year) %>% count()
+cydata_civpol <- data_onlycivpol %>% group_by(cowc_year) %>% count()
+cydata_environ <- data_onlyenviron %>% group_by(cowc_year) %>% count()
+cydata_physint <- data_onlyphysint %>% group_by(cowc_year) %>% count()
+cydata_opinion <- data_onlyopinion %>% group_by(cowc_year) %>% count()
+
+# Rename name variable
+cydata_ecosoc <- rename(cydata_ecosoc, ecosoc = n)
+cydata_civpol <- rename(cydata_civpol, civpol = n)
+cydata_environ <- rename(cydata_environ, environ = n)
+cydata_physint <- rename(cydata_physint, physint = n)
+cydata_opinion <- rename(cydata_opinion, opinion = n)
+
+# Left joint to Country-Year Panel
+cypanel <- left_join(cypanel, cydata_ecosoc, by = "cowc_year")
+cypanel <- left_join(cypanel, cydata_civpol, by = "cowc_year")
+cypanel <- left_join(cypanel, cydata_environ, by = "cowc_year")
+cypanel <- left_join(cypanel, cydata_physint, by = "cowc_year")
+cypanel <- left_join(cypanel, cydata_opinion, by = "cowc_year")
+
+# Recode missings as zeros
+cypanel$ecosoc <- ifelse(is.na(cypanel$ecosoc), 0, cypanel$ecosoc)
+cypanel$civpol <- ifelse(is.na(cypanel$civpol), 0, cypanel$civpol)
+cypanel$environ <- ifelse(is.na(cypanel$environ), 0, cypanel$environ)
+cypanel$physint <- ifelse(is.na(cypanel$physint), 0, cypanel$physint)
+cypanel$opinion <- ifelse(is.na(cypanel$opinion), 0, cypanel$opinion)
+
+
+```
+
+
+```{r}
+
+#### Create replied-variables for Mandate-specific OLs ####
+
+# Create sub-dataset that includes only OLs from given mandates
+replied_ecosoc <- filter(data_onlyecosoc, `Nb. of replies` > 0)
+replied_civpol <- filter(data_onlycivpol, `Nb. of replies` > 0)
+replied_environ <- filter(data_onlyenviron, `Nb. of replies` > 0)
+replied_physint <- filter(data_onlyphysint, `Nb. of replies` > 0)
+replied_opinion <- filter(data_onlyopinion, `Nb. of replies` > 0)
+
+# Create country_year level datasets
+cydata_recosoc <- replied_ecosoc %>% group_by(cowc_year) %>% count()
+cydata_rcivpol <- replied_civpol %>% group_by(cowc_year) %>% count()
+cydata_renviron <- replied_environ %>% group_by(cowc_year) %>% count()
+cydata_rphysint <- replied_physint %>% group_by(cowc_year) %>% count()
+cydata_ropinion <- replied_opinion %>% group_by(cowc_year) %>% count()
+
+# Rename name variable
+cydata_recosoc <- rename(cydata_recosoc, replied_ecosoc = n)
+cydata_rcivpol <- rename(cydata_rcivpol, replied_civpol = n)
+cydata_renviron <- rename(cydata_renviron, replied_environ = n)
+cydata_rphysint <- rename(cydata_rphysint, replied_physint = n)
+cydata_ropinion <- rename(cydata_ropinion, replied_opinion = n)
+
+# Left joint to Country-Year Panel
+cypanel <- left_join(cypanel, cydata_recosoc, by = "cowc_year")
+cypanel <- left_join(cypanel, cydata_rcivpol, by = "cowc_year")
+cypanel <- left_join(cypanel, cydata_renviron, by = "cowc_year")
+cypanel <- left_join(cypanel, cydata_rphysint, by = "cowc_year")
+cypanel <- left_join(cypanel, cydata_ropinion, by = "cowc_year")
+
+# Recode missings as zeros
+cypanel$replied_ecosoc <- ifelse(is.na(cypanel$replied_ecosoc), 0, cypanel$replied_ecosoc)
+cypanel$replied_civpol <- ifelse(is.na(cypanel$replied_civpol), 0, cypanel$replied_civpol)
+cypanel$replied_environ <- ifelse(is.na(cypanel$replied_environ), 0, cypanel$replied_environ)
+cypanel$replied_physint <- ifelse(is.na(cypanel$replied_physint), 0, cypanel$replied_physint)
+cypanel$replied_opinion <- ifelse(is.na(cypanel$replied_opinion), 0, cypanel$replied_opinion)
+
+```
+
+
+```{r}
+# Add Fariss HR scores
+fariss <- read_delim(file="HumanRightsProtectionScores_v4.01.csv", delim=",")
+
+# Prepare data
+fariss$cowc <- countrycode(fariss$COW, "cown", "cowc")
+fariss$COW[is.na(fariss$cowc)] # German Federal Republic
+fariss$YEAR[is.na(fariss$cowc)] # German Federal Republic until 1990
+fariss <- subset(fariss, !is.na(cowc))
+fariss$year <- fariss$YEAR
+fariss2 <- fariss %>% dplyr::select(cowc, year, theta_mean, theta_sd, CIRI)
+fariss2 <- filter(fariss2, year > 2009)
+# Check and remove duplicates
+see <- duplicated(fariss2[c("cowc", "year")])
+table(see)
+
+# Create unique identifier variable
+fariss2$cowc_year <- paste(fariss2$cowc, "_", fariss2$year)
+fariss2 <- dplyr::select(fariss2, cowc_year, theta_mean)
+
+# Left join
+cypanel <- left_join(cypanel, fariss2, by = "cowc_year")
+
+```
+
+
+```{r}
+# Add Armed Conflict
+conflict <- read_excel("ucdp-prio-acd-221.xlsx")
+
+# Select relevant variables and aggregate
+conflict <- conflict %>% dplyr::select(location, year) %>% 
+  group_by(location, year) %>% summarize(count = n()) %>% filter(year > 2009)
+
+# Separate conflicts that occur in several locations
+unique(conflict$location)
+conflict <- separate(conflict, col = location, into = c("country1", "country2"), sep = ",")
+
+# Add conflicts that affect multiple countries
+country2 <- filter(conflict, !is.na(country2))
+country2$country1 <- NULL
+country2 <- rename(country2, country = country2)
+conflict$country2 <- NULL
+conflict <- rename(conflict, country = country1)
+conflict <- rbind(conflict, country2)
+conflict$count <- NULL
+
+# Add Cowcodes
+conflict$cowc <- countrycode(conflict$country, "country.name", "cowc")
+conflict$cowc <- ifelse(conflict$country == "Yemen (North Yemen)", "YEM", conflict$cowc)
+
+# Duplicates
+see <- duplicated(conflict[c("cowc", "year")])
+conflict <- conflict[!see,]
+
+# Create unique identifiers
+conflict$cowc_year <- paste(conflict$cowc, "_", conflict$year)
+conflict$conflict <- 1
+conflict <- dplyr::select(conflict, cowc_year, conflict)
+
+# Remove duplicates
+conflict <- conflict[!duplicated(conflict$cowc_year), ]
+
+# Check which observations do not merge
+fails <- anti_join(conflict, cypanel, by = "cowc_year")
+
+# Left join to dataset
+cypanel <- left_join(cypanel, conflict, by = "cowc_year")
+cypanel$conflict <- ifelse(is.na(cypanel$conflict), 0, cypanel$conflict)
+cypanel$conflict <- ifelse(cypanel$year > 2021, NA, cypanel$conflict)
+
+```
+
+```{r}
+#Load World Bank data of GDP per capita
+gdpcap <- read.csv2("gdpcap_2022.csv")
+colnames(gdpcap) <- gsub("^X", "",  colnames(gdpcap))
+gdpdat <- gdpcap %>% 
+  gather(year, gdpcap, "1960":"2022")
+gdpdat$year <- as.numeric(gdpdat$year)
+gdpdat <- filter(gdpdat, year > 2009)
+gdpdat$cowc <- countrycode(gdpdat$Country.Name, "country.name", "cowc")
+gdpdat <- filter(gdpdat, !is.na(gdpdat$cowc))
+gdpdat$cowc_year <- paste(gdpdat$cowc, "_", gdpdat$year)
+
+# Check which obs do not merge
+fails <- anti_join(gdpdat, cypanel, by = "cowc_year") # all have matches
+
+# Select relevant variables
+gdpdat <- dplyr::select(gdpdat, cowc_year, gdpcap)
+
+# Check and remove duplicates
+see <- gdpdat[duplicated(gdpdat$cowc_year), ]
+gdpdat <- gdpdat[!duplicated(gdpdat$cowc_year), ]
+
+# Left join to dataset
+cypanel <- left_join(cypanel, gdpdat, by = "cowc_year")
+cypanel <- cypanel %>% group_by(cowc) %>% arrange(cowc, year) %>%
+            mutate(gdpcap_lag1 = lag(gdpcap,1))
+cypanel$gdpcap <- as.numeric(cypanel$gdpcap)
+cypanel$gdpcap_lag1 <- as.numeric(cypanel$gdpcap_lag1)
+
+```
+
+```{r}
+# Load V-Dem Version 13
+vdem <- read_delim(file="V-Dem-CY-Full+Others-v13.csv", delim=",")
+
+# Variables
+vdem2 <- vdem[,c("country_name", "country_id", "year"
+                ,"v2x_polyarchy", "v2x_libdem"
+                ,"v2x_accountability", "v2x_veracc", "v2x_diagacc", "v2x_horacc"
+                 ,"v2cseeorgs","v2csreprss", "v2cscnsult", "v2x_cspart",
+                 "v2csstruc_nr", "v2csprtcpt", "v2csgender"
+                ,"v2csantimv", "v2csanmvch_nr", "v2mecenefm",
+                "v2mecenefi", "v2meharjrn", "v2peedueq", 
+                "v2peapsecon", "v2clacjust", "v2cldiscw", "v2x_freexp",
+                "v2peasjgeo", "v2x_freexp_altinf", "v2cldiscm",
+                "v2juncind", "v2juhcind")]
+
+# Subset
+vdem3 <- subset(vdem2, year>=2009)
+
+# Add country code
+vdem3$cowc <- countrycode(vdem3$country_name, "country.name", "cowc") 
+vdem3$cowc[vdem3$country_name=="Serbia"] <- "YUG"
+vdem3 <- subset(vdem3, !is.na(cowc))
+
+# unique?
+table(duplicated(vdem3[c("cowc", "year")]))
+
+# Add lags
+calculate_lags <- function(df, var, lags){
+  map_lag <- lags %>% map(~partial(lag, n = .x))
+  return(df %>% mutate(across(.cols = {{var}}, .fns = map_lag, .names = "{.col}_lag{lags}")))
+}
+vdem4 <- vdem3 %>% arrange(cowc, year) %>% group_by(cowc) %>%
+                   calculate_lags(v2x_polyarchy, 1:3) %>%
+                   calculate_lags(v2x_libdem, 1:3) %>%
+                   calculate_lags(v2x_accountability, 1:3) %>%
+                   calculate_lags(v2x_veracc, 1:3) %>%
+                   calculate_lags(v2x_diagacc, 1:3) %>%
+                   calculate_lags(v2x_horacc, 1:3) %>%
+                   calculate_lags(v2x_cspart, 1:3) %>%
+                  calculate_lags(v2cseeorgs, 1:3) %>%
+                  calculate_lags(v2csreprss, 1:3) %>%
+                  calculate_lags(v2cscnsult, 1:3) %>%
+                  calculate_lags(v2mecenefm, 1:3) %>%
+                  calculate_lags(v2mecenefi, 1:3) %>%
+                  calculate_lags(v2meharjrn, 1:3) %>%
+                  calculate_lags(v2peedueq, 1:3) %>%
+                  calculate_lags(v2x_freexp, 1:3) %>%
+                  calculate_lags(v2cldiscw, 1:3) %>%
+                  calculate_lags(v2cldiscm, 1:3) %>%
+                  calculate_lags(v2x_freexp_altinf, 1:3) %>%
+                  calculate_lags(v2peapsecon, 1:3) %>%
+                  calculate_lags(v2clacjust, 1:3) %>%
+                  calculate_lags(v2peasjgeo, 1:3) %>%
+                  calculate_lags(v2csprtcpt, 1:3)  %>% 
+                  calculate_lags(v2juhcind, 1:3) %>% dplyr::select(-country_name, -country_id) %>% 
+                  relocate(cowc, year) %>% as.data.frame()
+
+# Check and remove duplicates
+see <- duplicated(vdem4[c("cowc", "year")])
+table(see)
+vdem4 <- vdem4[!see,]
+
+# Left join
+vdem4$cowc_year <- paste(vdem4$cowc, "_", vdem4$year)
+vdem4 <- dplyr::select(vdem4, -cowc, -year)
+cypanel <- left_join(cypanel, vdem4, by = "cowc_year")
+
+
+
+```
+
+```{r}
+# Add PTS
+pts <- read_excel("PTS-2022.xlsx")
+
+# Prepare PTS
+pts$cowc <- countrycode(pts$Country, "country.name", "cowc")
+table(pts$Country[is.na(pts$cowc)])
+pts$cowc[pts$Country=="Serbia"] <- "YUG"
+pts$year <- pts$Year
+pts2 <- pts %>% dplyr::select(cowc, year, PTS_A, PTS_H, PTS_S)
+
+# Check and remove duplicates
+see <- duplicated(pts2[c("cowc", "year")])
+table(see)
+pts2 <- pts2[!see, ]
+
+# Left Join
+pts2$cowc_year <- paste(pts2$cowc, "_", pts2$year)
+pts2 <- dplyr::select(pts2, -cowc, -year)
+cypanel <- left_join(cypanel, pts2, by = "cowc_year")
+
+# As numeric
+cypanel$PTS_A <- as.numeric(cypanel$PTS_A)
+cypanel$PTS_H <- as.numeric(cypanel$PTS_H)
+cypanel$PTS_S <- as.numeric(cypanel$PTS_S)
+
+
+```
+
+```{r}
+# HR treaty ratified
+iccpr <- read.dta13("HRTreatRatificationData.dta")
+iccpr$cowc <- countrycode(iccpr$COUNTRY, "country.name", "cowc")
+see <- filter(iccpr, is.na(cowc))
+iccpr$cowc[iccpr$COUNTRY == "Serbia"] <- "YUG"
+iccpr$cowc[iccpr$COUNTRY == "Cote D'lvoire"] <- "CDI"
+iccpr$cowc[iccpr$COUNTRY == "Korea, People's Republic of"] <- "PRK"
+table( duplicated( iccpr[c("cowc", "YEAR")] ) )
+iccpr$cowc_year <- paste(iccpr$cowc, "_", iccpr$YEAR)
+iccpr <- iccpr[!duplicated(iccpr$cowc_year), ]
+iccpr <- filter(iccpr, YEAR > 2009)
+iccpr_small <- dplyr::select(iccpr, cowc_year, ICCPR2, CAT2)
+
+# Left join
+cypanel <- left_join(cypanel, iccpr_small, by = "cowc_year")
+cypanel <- cypanel %>% group_by(cowc) %>% 
+  tidyr::fill(CAT2) 
+cypanel <- cypanel %>% group_by(cowc) %>% 
+  tidyr::fill(ICCPR2) 
+cypanel$ICCPR2 <- ifelse(is.na(cypanel$ICCPR2), 0, cypanel$ICCPR2)
+cypanel$CAT2 <- ifelse(is.na(cypanel$CAT2), 0, cypanel$CAT2)
+
+
+```
+
+
+```{r}
+# Load World Bank data of Population size
+popsize <- read.csv2("popsize.csv")
+colnames(popsize) <- gsub("^X", "",  colnames(popsize))
+popsize <- popsize %>% 
+  gather(year, popsize, "1960":"2022")
+popsize$year <- as.numeric(popsize$year)
+popsize <- filter(popsize, year > 1978)
+popsize$cowc <- countrycode(popsize$Country.Name, "country.name", "cowc")
+popsize <- popsize %>%  filter(!is.na(cowc))
+popsize$cowc_year <- paste(popsize$cowc, "_", popsize$year)
+popsize <- filter(popsize, year > 2009)
+
+# Check which obs do not merge
+fails <- anti_join(popsize, cypanel, by = "cowc_year") # all have matches
+
+# Select relevant variables
+popsize <- dplyr::select(popsize, cowc_year, popsize)
+
+# Check and remove duplicates
+see <- popsize[duplicated(popsize$cowc_year), ]
+popsize <- popsize[!duplicated(popsize$cowc_year), ]
+
+# Left join to dataset
+cypanel <- left_join(cypanel, popsize, by = "cowc_year")
+
+# Create lagged popsize variable
+cypanel <- cypanel %>% group_by(cowc) %>% arrange(cowc, year) %>%
+            mutate(popsize_lag1 = lag(popsize,1))
+
+
+
+```
+
+```{r}
+#### Add data on the nationalities of mandate holders ####
+mandholders <- read_excel("mandateholder_nationality.xlsx")
+mandholders <- dplyr::select(mandholders, cowc_year, mandateholder)
+
+# Check merge fails
+fails <- anti_join(cypanel, mandholders, by = "cowc_year")
+fails2 <- anti_join(mandholders, cypanel, by = "cowc_year") # 0 fails, all merge
+
+# Left join
+cypanel <- left_join(cypanel, mandholders, by = "cowc_year")
+
+# Clean Cypanel and get rid of non-existing states
+cypanel <- filter(cypanel, country != "Austria-Hungary", country != "Baden", country !=  "Bavaria", 
+                  country != "Czechoslovakia", country != "German Democratic Republic", 
+                  country != "German Federal Republic", country != "Hanover", country != "Hesse Electoral",
+                  country != "Hesse Grand Ducal", country != "Korea", country != "Mecklenburg Schwerin",
+                  country != "Modena", country != "Papal States", country != "Parma", 
+                  country != "Republic of Vietnam", country != "Saxony", country != "Two Sicilies",
+                  country != "Tuscany", country != "Wuerttemburg", country != "Yemen Arab Republic",
+                  country != "Yemen People's Republic")
+cypanel <- cypanel[!duplicated(cypanel$cowc_year), ]
+
+```
+
+
+
+```{r}
+#### Write dataset for analysis ####
+
+# Write CSV file
+write.csv(cypanel, file.path(".", "UNSP_OtherLetters_Panel.csv"), row.names = F)
+
+
+```
+
+

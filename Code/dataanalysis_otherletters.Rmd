@@ -1,0 +1,773 @@
+---
+title: "unsp_dataanalysis"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = F, message = F, comment = F, warning =F)
+```
+
+
+```{r, message = F, comment = F}
+library(tidyverse)
+library(lme4)
+library(broom)
+library(texreg)
+library(ggridges)
+library(readxl)
+library(giscoR)
+library(countrycode)
+library(sf)
+library(texreg)
+library(tidyr)
+library(lfe)
+library(car)
+library(stargazer)
+library(sampleSelection)
+
+```
+
+
+```{r}
+# reading the data
+rm(list = ls())
+data <- read_csv2("UNSP_OtherLetters_Panel.csv")
+
+```
+
+```{r}
+#### Create a world map ####
+
+# Aggregate by country
+country_based_OL <- data %>% 
+  group_by(country) %>% 
+  summarise(other_letters = sum(other_letters)) %>% 
+  arrange(desc(other_letters)) %>%
+  ungroup()
+
+# get coordinates and merge
+countries <- gisco_get_countries(year = "2016") 
+countries <- subset(countries, CNTR_NAME != "Antarctica")
+countries_small <- dplyr::select(countries, ISO3_CODE, geometry)
+country_based_OL$ISO3_CODE <- countrycode(country_based_OL$country, origin = "country.name", destination = "iso3c")
+country_based_OL <- merge(country_based_OL, countries_small, by = "ISO3_CODE", all.x = T, all.y = T) 
+
+# Recode NAs
+country_based_OL$other_letters <- ifelse(is.na(country_based_OL$other_letters), 0, country_based_OL$other_letters)
+
+# Create world map
+ggplot(data = country_based_OL$geometry) + 
+  geom_sf(aes(fill = country_based_OL$other_letters), size = 0.02) +
+  scale_fill_viridis_c(option = "A", direction = -1, name = "# of OLs") +
+  theme(plot.title = element_text(hjust = 0.5)) +  
+  theme(axis.text.x = element_blank(), axis.ticks = element_blank())
+#ggsave("map_otherletters_notitle.pdf", device = cairo_pdf(), width = 297, height = 210, units = "mm")
+
+# Check across continents
+continents <- gisco_countrycode
+country_based_OL <- country_based_OL %>% left_join(continents, by = "ISO3_CODE")
+aggregate(country_based_OL$other_letters, by=list(country_based_OL$continent), FUN=median)
+aggregate(country_based_OL$other_letters, by=list(country_based_OL$continent), FUN=mean)
+
+
+```
+
+```{r}
+#### Map the number of OLs over time and the number of replies ####
+
+# aggregate both variables by year
+yeardat <- data %>% filter(year < 2023) %>% 
+  filter(year > 2015) %>% 
+  group_by(year) %>% summarize(yearly_ols = sum(other_letters), yearly_replies = sum(replied))
+yeardat$share_replies <- yeardat$yearly_replies / yeardat$yearly_ols
+
+# reshape data
+yeardat2 <- yeardat %>% pivot_longer(., cols = c("yearly_ols", "yearly_replies")) 
+yeardat2 <- dplyr::rename(yeardat2, Legend = name)
+yeardat2$Legend <- ifelse(yeardat2$Legend == "yearly_ols", "Other Letters", yeardat2$Legend)
+yeardat2$Legend <- ifelse(yeardat2$Legend == "yearly_replies", "Replies", yeardat2$Legend)
+yeardat2$share_replies <- ifelse(yeardat2$Legend == "Other Letters", NA, yeardat2$share_replies)
+yeardat3 <- filter(yeardat2, !is.na(share_replies))
+
+# create plots
+ggplot() + geom_line(data = yeardat2, aes(x = year, y = value, color = Legend)) + theme_bw() +
+  scale_x_continuous(breaks = c(2015:2022)) + xlab("") + ylab("Global # of OLs")
+ggplot(yeardat2, aes(fill=Legend, y=value, x=year)) + 
+    geom_bar(position="stack", stat="identity") + xlab("") + theme_bw() +
+  scale_x_continuous(breaks = c(2016:2022)) +
+  scale_y_continuous(breaks = seq(0, 250, by = 50))+ylab("") +
+  scale_fill_manual(values = c("Other Letters"= "coral", "Replies" = "darkslategray3")) +
+   geom_text(data = yeardat3, aes(label = paste0(round(share_replies*100),"%")), 
+            position = position_stack(vjust = 0.5), size = 3) 
+#ggsave("ol_replies_overtime.pdf", device = cairo_pdf(), width = 297, height = 210, units = "mm")
+
+
+```
+
+
+```{r}
+#### Map the number of OLs over time in relation to other Communication types ####
+
+# read complete data
+data_full <- read_excel("./UNSpecialProcedures_Communications_retrieved05.05.2023.xlsx")
+data_full <- dplyr::rename(data_full, ref_no = `Ref. no.`)
+data_full$year <- sub(".*/", "",data_full$ref_no)
+data_full$year <- as.numeric(data_full$year)
+
+# Rename "Joint" UL, AL, and OL
+data_full$Type <- ifelse(data_full$Type == "JUA", "UA", data_full$Type)
+data_full$Type <- ifelse(data_full$Type == "JAL", "AL", data_full$Type)
+data_full$Type <- ifelse(data_full$Type == "JOL", "OL", data_full$Type)
+
+# aggregate by type and year
+yeartype <- data_full %>% filter(year < 2023) %>%  group_by(year, Type) %>%  count()
+
+# plot
+ggplot() + geom_point(data = yeartype, aes(x = year, y = n, color = Type), size = 3.5) + theme_bw() + xlab("") +  scale_x_continuous(breaks = c(2010:2022)) + ylab("")
+#ggsave("commtypes_overtime.pdf", device = cairo_pdf(), width = 297, height = 210, units = "mm")
+
+
+```
+
+
+```{r}
+#### Replies by country ####
+
+# Create variable for share of replied OLs in country-year panel data
+data$share_replied <- (data$replied / data$other_letters)
+data$share_replied <- ifelse(is.nan(data$share_replied), NA, data$share_replied)
+
+# Aggregate the share of replies by country-year
+country_based_shrep <- data %>% 
+  group_by(country) %>% 
+  summarise(avg_share_replied = mean(share_replied, na.rm = T)) %>% 
+  ungroup()
+
+# Merge with coordinate dataset
+country_based_shrep$ISO3_CODE <- countrycode(country_based_shrep$country, origin = "country.name", destination = "iso3c")
+country_based_shrep <- merge(country_based_shrep, countries_small, by = "ISO3_CODE", all.x = T, all.y = T) 
+
+# Rename NANs to NAs
+country_based_shrep$avg_share_replied <- ifelse(is.nan(country_based_shrep$avg_share_replied), NA, 
+                                                country_based_shrep$avg_share_replied)
+
+# Create world map
+ggplot(data = country_based_shrep$geometry) + 
+  geom_sf(aes(fill = country_based_shrep$avg_share_replied), size = 0.02) +
+  scale_fill_viridis_c(option = "I", direction = -1, name = "Share replied") +
+  theme(plot.title = element_text(hjust = 0.5)) +  
+  theme(axis.text.x = element_blank(), axis.ticks = element_blank())
+#ggsave("share_letters_replied.pdf", device = cairo_pdf(), width = 297, height = 210, units = "mm")
+
+# Check across continents
+continents <- gisco_countrycode
+country_based_shrep <- country_based_shrep %>% left_join(continents, by = "ISO3_CODE")
+aggregate(country_based_shrep$avg_share_replied, by=list(country_based_shrep$continent), FUN=median, na.rm = T)
+aggregate(country_based_shrep$avg_share_replied, by=list(country_based_shrep$continent), FUN=mean, na.rm= T)
+
+
+```
+
+```{r}
+#### Plot distribution of OLs across mandates ####
+oldat <- read.csv2("otherletters.csv")
+
+# Create dummies for each mandate
+oldat$African_Descent <- str_detect(oldat$Mandates, "african")
+oldat$African_Descent <- ifelse(oldat$African_Descent == TRUE, 1, 0) # 0
+oldat$Albinism <- str_detect(oldat$Mandates, "albinism")
+oldat$Albinism <- ifelse(oldat$Albinism == TRUE, 1, 0) # 3
+oldat$Detention <- str_detect(oldat$Mandates, "detention")
+oldat$Detention <- ifelse(oldat$Detention == TRUE, 1, 0) # 0
+oldat$Business <- str_detect(oldat$Mandates, "business")
+oldat$Business <- ifelse(oldat$Business == TRUE, 1, 0) # 135
+oldat$Climate <- str_detect(oldat$Mandates, "climate")
+oldat$Climate <- ifelse(oldat$Climate == TRUE, 1, 0) # 1
+oldat$Culture <- str_detect(oldat$Mandates, "cultural")
+oldat$Culture <- ifelse(oldat$Culture == TRUE, 1, 0) # 13
+oldat$Development <- str_detect(oldat$Mandates, "developmemt")
+oldat$Development <- ifelse(oldat$Development == TRUE, 1, 0) # 0
+oldat$Disabilities <- str_detect(oldat$Mandates, "disabilities")
+oldat$Disabilities <- ifelse(oldat$Disabilities == TRUE, 1, 0) # 0
+oldat$Disappearances <- str_detect(oldat$Mandates, "disappearances")
+oldat$Disappearances <- ifelse(oldat$Disappearances == TRUE, 1, 0) # 34
+oldat$Education <- str_detect(oldat$Mandates, "education")
+oldat$Education <- ifelse(oldat$Education == TRUE, 1, 0) # 22
+oldat$Environment <- str_detect(oldat$Mandates, "environment")
+oldat$Environment <- ifelse(oldat$Environment == TRUE, 1, 0) # 110
+oldat$Executions <- str_detect(oldat$Mandates, "executions")
+oldat$Executions <- ifelse(oldat$Executions == TRUE, 1, 0) # 48
+oldat$Food <- str_detect(oldat$Mandates, "food")
+oldat$Food <- ifelse(oldat$Food == TRUE, 1, 0) # 13
+oldat$Debt <- str_detect(oldat$Mandates, "debt")
+oldat$Debt <- ifelse(oldat$Debt == TRUE, 1, 0) # 63
+oldat$Opinion <- str_detect(oldat$Mandates, "opinion")
+oldat$Opinion <- ifelse(oldat$Opinion == TRUE, 1, 0) # 228
+oldat$Assembly <- str_detect(oldat$Mandates, "assembly")
+oldat$Assembly <- ifelse(oldat$Assembly == TRUE, 1, 0) # 154
+oldat$Mental_Health <- str_detect(oldat$Mandates, "mental")
+oldat$Mental_Health <- ifelse(oldat$Mental_Health == TRUE, 1, 0) # 0
+oldat$Housing <- str_detect(oldat$Mandates, "housing")
+oldat$Housing <- ifelse(oldat$Housing == TRUE, 1, 0) # 16
+oldat$HR_defenders <- str_detect(oldat$Mandates, "defenders")
+oldat$HR_defenders <- ifelse(oldat$HR_defenders == TRUE, 1, 0) # 139
+oldat$Judges <- str_detect(oldat$Mandates, "judges")
+oldat$Judges <- ifelse(oldat$Judges == TRUE, 1, 0) # 37
+oldat$Indigenous <- str_detect(oldat$Mandates, "indigenous")
+oldat$Indigenous <- ifelse(oldat$Indigenous == TRUE, 1, 0) # 78
+oldat$Displacement <- str_detect(oldat$Mandates, "displaced")
+oldat$Displacement <- ifelse(oldat$Displacement == TRUE, 1, 0) # 37
+oldat$Equitable_order <- str_detect(oldat$Mandates, "order")
+oldat$Equitable_order <- ifelse(oldat$Equitable_order == TRUE, 1, 0) # 121
+oldat$Solidarity <- str_detect(oldat$Mandates, "solidarity")
+oldat$Solidarity <- ifelse(oldat$Solidarity == TRUE, 1, 0) # 60
+oldat$Leprosy <- str_detect(oldat$Mandates, "leprosy")
+oldat$Leprosy <- ifelse(oldat$Leprosy == TRUE, 1, 0) # 1
+oldat$Mercenaries <- str_detect(oldat$Mandates, "mercenaries")
+oldat$Mercenaries <- ifelse(oldat$Mercenaries == TRUE, 1, 0) # 0
+oldat$Migrants <- str_detect(oldat$Mandates, "migrants")
+oldat$Migrants <- ifelse(oldat$Migrants == TRUE, 1, 0) # 25
+oldat$Minorities <- str_detect(oldat$Mandates, "minority")
+oldat$Minorities <- ifelse(oldat$Minorities == TRUE, 1, 0) # 43
+oldat$Older_persons <- str_detect(oldat$Mandates, "older")
+oldat$Older_persons <- ifelse(oldat$Older_persons == TRUE, 1, 0) # 35
+oldat$Poverty <- str_detect(oldat$Mandates, "poverty")
+oldat$Poverty <- ifelse(oldat$Poverty == TRUE, 1, 0) # 40
+oldat$Privacy <- str_detect(oldat$Mandates, "privacy")
+oldat$Privacy <- ifelse(oldat$Privacy == TRUE, 1, 0) # 40
+oldat$Racism <- str_detect(oldat$Mandates, "racism")
+oldat$Racism <- ifelse(oldat$Racism == TRUE, 1, 0) # 59
+oldat$Religion <- str_detect(oldat$Mandates, "religion")
+oldat$Religion <- ifelse(oldat$Religion == TRUE, 1, 0) # 48
+oldat$Sexual_abuse <- str_detect(oldat$Mandates, "sexual abuse")
+oldat$Sexual_abuse <- ifelse(oldat$Sexual_abuse == TRUE, 1, 0) # 0
+oldat$Gender <- str_detect(oldat$Mandates, "gender")
+oldat$Gender <- ifelse(oldat$Gender == TRUE, 1, 0) # 25
+oldat$Slavery <- str_detect(oldat$Mandates, "slavery")
+oldat$Slavery <- ifelse(oldat$Slavery == TRUE, 1, 0) # 16
+oldat$Terrorism <- str_detect(oldat$Mandates, "terrorism")
+oldat$Terrorism <- ifelse(oldat$Terrorism == TRUE, 1, 0) # 76
+oldat$Torture <- str_detect(oldat$Mandates, "torture")
+oldat$Torture <- ifelse(oldat$Torture == TRUE, 1, 0) # 51
+oldat$Waste <- str_detect(oldat$Mandates, "waste")
+oldat$Waste <- ifelse(oldat$Waste == TRUE, 1, 0) # 0
+oldat$Trafficking <- str_detect(oldat$Mandates, "trafficking")
+oldat$Trafficking <- ifelse(oldat$Trafficking == TRUE, 1, 0) # 20
+oldat$Truth_justice <- str_detect(oldat$Mandates, "truth")
+oldat$Truth_justice <- ifelse(oldat$Truth_justice == TRUE, 1, 0) # 20
+oldat$Unilateral_coercion <- str_detect(oldat$Mandates, "unilateral")
+oldat$Unilateral_coercion <- ifelse(oldat$Unilateral_coercion == TRUE, 1, 0) # 4
+oldat$Violence_women <- str_detect(oldat$Mandates, "violence against")
+oldat$Violence_women <- ifelse(oldat$Violence_women == TRUE, 1, 0) # 44
+oldat$Water <- str_detect(oldat$Mandates, "water")
+oldat$Water <- ifelse(oldat$Water == TRUE, 1, 0) # 163
+oldat$Discrimination_women <- str_detect(oldat$Mandates, "discrimination against women")
+oldat$Discrimination_women <- ifelse(oldat$Discrimination_women == TRUE, 1, 0) # 0
+
+# Create vector with number of OLs by mandate
+mandatevec <- c(rep("Opinion", 228), rep("Water", 163), rep("Assembly", 154), rep("HR_defenders", 139),
+                rep("Business", 135), rep("Equitable_order", 121), rep("Environment", 110),
+                rep("Indigenous", 78), rep("Terrorism", 76), rep("Foreign_debt", 63),
+                rep("Solidarity", 60), rep("Racism", 59), rep("Torture", 51), rep("Executions", 48),
+                rep("Religion", 48), rep("Violence_women", 44), rep("Privacy", 40), rep("Displacement", 37), 
+                rep("Judges", 37), rep("Disappearances", 34), rep("Gender", 25), rep("Education", 22),
+                rep("Human_trafficking", 20), rep("Truth_justice", 20), rep("Salvery", 16), rep("Housing", 16), rep("Culture", 13), rep("Food", 13), rep("Unilateral_coercion", 4),  rep("Albinism", 3),  rep("Climate", 1), rep("Leprosy", 1))
+
+#pdf(file = "permandate.pdf", width = 12, height = 10)
+par(mar=c(5,10,5,5))
+barplot(sort(table(mandatevec)),
+        ylab = "",
+        xlab = "# of OLs", horiz = T, las=1, cex.lab = 1, col = "grey",  xlim=c(0,250))
+#dev.off()
+
+```
+
+```{r}
+#### Plot distribution of mandate holders across countries ####
+
+# Aggregate mandate holders by country
+mh_bycountry <- data %>% group_by(country) %>% summarize(n_mh = sum(mandateholder))
+mh_bycountry <- mh_bycountry[order(mh_bycountry$n_mh,decreasing = TRUE),]
+mh_bycountry <- filter(mh_bycountry, n_mh > 9)
+mh_bycountry$rev_country <- rev(mh_bycountry$country)
+mh_bycountry$rev_country[mh_bycountry$rev_country == "United States of America"] <- "US"
+
+# Plot
+#pdf(file = "national_mandateholders.pdf", width = 12, height = 10)
+par(mar=c(5,10,5,5))
+barplot(sort(mh_bycountry$n_mh), names.arg = mh_bycountry$rev_country, horiz = T, cex.lab = 1, col = "grey", las = 1, xlim=c(0,70), ylab = "",
+        xlab = "# of Special Procedure Mandate Holders")
+#dev.off()
+
+
+
+```
+```{r}
+#### Plot distribution of categories of OL impact ####
+
+# Create vector with frequency of categories
+olimpact <- c(rep("Allegations rejected", 62), rep("Immaterial response", 13), rep("Pending", 12), rep("Law withdrawn", 4),
+                rep("Allegations addressed", 17))
+
+# Plot
+#pdf(file = "impact_ols_opinion.pdf", width = 12, height = 10)
+par(mar=c(5,10,5,5))
+barplot(sort(table(olimpact)),
+        ylab = "",
+        xlab = "# of state responses to OLs", horiz = T, las=1, cex.lab = 1, col = c("darkslategray3", "coral", "coral", "darkslategray3", "coral"), xlim=c(0,70), border = c("black", "black", "black", "black", "black"))
+#dev.off()
+
+
+```
+
+
+
+```{r}
+#### Analysis: do replies predict further OLs? ####
+
+# Create lags and prepare variable
+data$theta_mean <- as.numeric(data$theta_mean)
+data <- data %>% group_by(cowc) %>% arrange(cowc, year) %>%
+            mutate(replied_lag1 = lag(replied,1))
+data <- data %>% group_by(cowc) %>% arrange(cowc,year) %>% 
+  mutate(fariss_lag1 = lag(theta_mean, 1))
+data <- data %>% group_by(cowc) %>% arrange(cowc,year) %>% 
+  mutate(iccpr_lag1 = lag(ICCPR2, 1))
+data <- data %>% group_by(cowc) %>% arrange(cowc,year) %>% 
+  mutate(conflict_lag1 = lag(conflict, 1))
+data <- data %>% group_by(cowc) %>% arrange(cowc,year) %>% 
+  mutate(mandateholder_lag1 = lag(mandateholder, 1))
+data$log_gdpcap_lag1 <- log(data$gdpcap_lag1)
+data$log_popsize_lag1 <- log(data$popsize_lag1)
+data$v2x_libdem_lag1 <- as.numeric(data$v2x_libdem_lag1)
+data$v2x_cspart_lag1 <- as.numeric(data$v2x_cspart_lag1)
+data$v2juhcind_lag1 <- as.numeric(data$v2juhcind_lag1)
+data$v2mecenefm_lag1 <- as.numeric(data$v2mecenefm_lag1)
+data$v2x_polyarchy_lag1 <- as.numeric(data$v2x_polyarchy_lag1)
+
+# Multicollinearity tests for controls
+mtest <- lm(other_letters ~  replied_lag1 + fariss_lag1 + v2x_libdem_lag1 + log_gdpcap_lag1 + v2x_cspart_lag1 + iccpr_lag1 + conflict_lag1 + log_popsize_lag1 + mandateholder_lag1, data=data)
+vif(mtest)
+
+# OLS regression analyses
+### Models with Country FEs
+m1<- felm(other_letters ~ replied_lag1 | cowc | 0 | cowc, data=data)
+summary(m1)
+screenreg(m1)
+m2<- felm(other_letters ~ replied_lag1 + fariss_lag1 + v2x_libdem_lag1 + log_gdpcap_lag1 + v2x_cspart_lag1 + iccpr_lag1 + conflict_lag1 + log_popsize_lag1 + mandateholder_lag1 | cowc | 0 | cowc, data=data)
+summary(m2)
+screenreg(m2)
+### Models with twoway FEs
+m3<- felm(other_letters ~ replied_lag1 | cowc + year | 0 | cowc, data=data)
+summary(m3)
+screenreg(m3)
+m4<- felm(other_letters ~ replied_lag1 + fariss_lag1 + v2x_libdem_lag1 + log_gdpcap_lag1 + v2x_cspart_lag1 + iccpr_lag1 + conflict_lag1 + log_popsize_lag1 + mandateholder_lag1| cowc + year  | 0 | cowc, data=data)
+summary(m4)
+screenreg(m4)
+### Models only with year FEs
+m5<- felm(other_letters ~ replied_lag1 | year | 0 | cowc, data=data)
+summary(m5)
+screenreg(m5)
+m6 <- felm(other_letters ~ replied_lag1 + fariss_lag1 + v2x_libdem_lag1 + log_gdpcap_lag1 + v2x_cspart_lag1 + iccpr_lag1 + conflict_lag1 + log_popsize_lag1 + mandateholder_lag1 | year  | 0 | cowc, data=data)
+summary(m6)
+screenreg(m6)
+# Report results
+stargazer(m5, m1, m3, m6, m2, m4
+          , out = "ol-models.tex", type="latex"
+          , digits=3, font.size="scriptsize"
+          , notes.align ="l", notes= "Cluster-robust standard errors", notes.append = T
+          , dep.var.labels.include	= F, dep.var.caption="DV: Other Letters received by the UNSP"
+          , column.labels = c("(1)", "(2)", "(3)", "(4)", "(5)", "(6)")
+          , add.lines = list(c("Year FEs", "🗸", "×", "🗸", "🗸", "×", "🗸"), c("Country FEs", "×", "🗸", "🗸", "×", "🗸", "🗸"))
+          , column.sep.width = "1pt", model.numbers=F, table.placement="H")
+
+
+#### Note 1: higher values libdem indicate more liberal democracy
+#### Note 2: higher values fariss indicate less physintabuse
+
+# Joint distributions of key vars with OLs
+ggplot(data, aes(fariss_lag1, other_letters)) + xlab("Fariss HR score") +
+  ylab("OLs obtained by governments") +
+  geom_smooth(method = "loess", span = 0.5) +
+  theme_bw()
+#pdf(file = "correlation_ol_libdem.pdf")
+ggplot(data, aes(v2x_libdem_lag1, other_letters)) + xlab("Liberal Democracy score") +
+  ylab("OLs obtained by governments") +
+  geom_smooth(method = "loess", span = 0.8) +
+  theme_bw()
+#dev.off()
+
+
+#### Check for over-dispersion ####
+
+# Compare simple poisson with negative binomial
+m1 <- glm(other_letters ~ replied_lag1 + fariss_lag1 + v2x_libdem_lag1 + log_gdpcap_lag1 + v2x_cspart_lag1 + iccpr_lag1 + conflict_lag1 + log_popsize_lag1 + mandateholder_lag1, data = data, family = "poisson")
+summary(m1)
+
+library(MASS)
+m2 <- glm.nb(other_letters ~ replied_lag1 + fariss_lag1 + v2x_libdem_lag1 + log_gdpcap_lag1 + v2x_cspart_lag1 + iccpr_lag1 + conflict_lag1 + log_popsize_lag1 + mandateholder_lag1, data = data, control = glm.control(maxit = 100))
+summary(m2)
+
+# Likelihood ratio test for overdispersion
+L1 <- logLik(m1) # Log Likelihood of model 1
+L2 <- logLik(m2) # Log Likelihood of model 2
+LRT <- -2 * L1 + 2 * L2 # converges to chi^2 distribution
+LRT > qchisq(0.95, df = 1) # reject null hypothesis: overdispersion present
+
+
+# Negative binomial regression models
+### Models with Country FEs
+m1<- glm.nb(other_letters ~ replied_lag1 + factor(cowc), data = data, control = glm.control(maxit = 100))
+summary(m1)
+screenreg(m1)
+m2<- glm.nb(other_letters ~ replied_lag1 + fariss_lag1 + v2x_libdem_lag1 + log_gdpcap_lag1 + v2x_cspart_lag1 + iccpr_lag1 + conflict_lag1 + log_popsize_lag1 + mandateholder_lag1 + factor(cowc), data = data, control = glm.control(maxit = 100))
+summary(m2)
+screenreg(m2)
+### Models with Year FEs
+m1<- glm.nb(other_letters ~ replied_lag1 + factor(year), data = data, control = glm.control(maxit = 100))
+summary(m1)
+screenreg(m1)
+m2<- glm.nb(other_letters ~ replied_lag1 + fariss_lag1 + v2x_libdem_lag1 + log_gdpcap_lag1 + v2x_cspart_lag1 + iccpr_lag1 + conflict_lag1 + log_popsize_lag1 + mandateholder_lag1 + factor(year), data = data, control = glm.control(maxit = 100))
+summary(m2)
+screenreg(m2)
+
+
+```
+
+```{r}
+#### Re-run OLS models with OLs from specific mandates ####
+# OLS regression analyses
+
+# Create lags and prepare variable
+data <- data %>% group_by(cowc) %>% arrange(cowc, year) %>%
+            mutate(replied_civpol_lag1 = lag(replied_civpol,1))
+data <- data %>% group_by(cowc) %>% arrange(cowc, year) %>%
+            mutate(replied_ecosoc_lag1 = lag(replied_ecosoc,1))
+data <- data %>% group_by(cowc) %>% arrange(cowc, year) %>%
+            mutate(replied_environ_lag1 = lag(replied_environ,1))
+data <- data %>% group_by(cowc) %>% arrange(cowc, year) %>%
+            mutate(replied_physint_lag1 = lag(replied_physint,1))
+data <- data %>% group_by(cowc) %>% arrange(cowc, year) %>%
+            mutate(opinion_lag1 = lag(opinion,1))
+data <- data %>% group_by(cowc) %>% arrange(cowc, year) %>%
+            mutate(replied_opinion_lag1 = lag(replied_opinion,1))
+data <- data %>% group_by(cowc) %>% arrange(cowc, year) %>%
+            mutate(physint_lag1 = lag(physint,1))
+
+# EcoSoc
+### Models with Country FEs
+mc_ecosoc <- felm(ecosoc ~ replied_ecosoc_lag1 + fariss_lag1 + v2x_libdem_lag1 + log_gdpcap_lag1 + v2x_cspart_lag1 + iccpr_lag1 + conflict_lag1 + log_popsize_lag1 + mandateholder_lag1| cowc | 0 | cowc, data=data)
+summary(mc_ecosoc)
+screenreg(mc_ecosoc)
+### Models with twoway FEs
+m4<- felm(ecosoc ~ replied_ecosoc_lag1 + fariss_lag1 + v2x_libdem_lag1 + log_gdpcap_lag1 + v2x_cspart_lag1 + iccpr_lag1 + conflict_lag1 + log_popsize_lag1 + mandateholder_lag1| cowc + year  | 0 | cowc, data=data)
+summary(m4)
+screenreg(m4)
+### Models only with year FEs
+my_ecosoc <- felm(ecosoc ~ replied_ecosoc_lag1 + fariss_lag1 + v2x_libdem_lag1 + log_gdpcap_lag1 + v2x_cspart_lag1 + iccpr_lag1 + conflict_lag1 + log_popsize_lag1 + mandateholder_lag1| year  | 0 | cowc, data=data)
+summary(my_ecosoc)
+screenreg(my_ecosoc)
+
+# Civpol
+### Models with Country FEs
+mc_civpol <- felm(civpol ~ replied_civpol_lag1 + fariss_lag1 + v2x_libdem_lag1 + log_gdpcap_lag1 + v2x_cspart_lag1 + iccpr_lag1 + conflict_lag1 + log_popsize_lag1 + mandateholder_lag1| cowc | 0 | cowc, data=data)
+summary(mc_civpol)
+screenreg(mc_civpol)
+### Models with twoway FEs
+m4<- felm(civpol ~ replied_civpol_lag1 + fariss_lag1 + v2x_libdem_lag1 + log_gdpcap_lag1 + v2x_cspart_lag1 + iccpr_lag1 + conflict_lag1 + log_popsize_lag1 + mandateholder_lag1| cowc + year  | 0 | cowc, data=data)
+summary(m4)
+screenreg(m4)
+### Models only with year FEs
+my_civpol <- felm(civpol ~ replied_civpol_lag1 + fariss_lag1 + v2x_libdem_lag1 + log_gdpcap_lag1 + v2x_cspart_lag1 + iccpr_lag1 + conflict_lag1 + log_popsize_lag1 + mandateholder_lag1| year  | 0 | cowc, data=data)
+summary(my_civpol)
+screenreg(my_civpol)
+
+# Physint
+### Models with Country FEs
+mc_physint <- felm(physint ~ replied_physint_lag1 + fariss_lag1 + v2x_libdem_lag1 + log_gdpcap_lag1 + v2x_cspart_lag1 + iccpr_lag1 + conflict_lag1 + log_popsize_lag1 + mandateholder_lag1| cowc | 0 | cowc, data=data)
+summary(mc_physint)
+screenreg(mc_physint)
+### Models with twoway FEs
+m4 <- felm(physint ~ replied_physint_lag1 + fariss_lag1 + v2x_libdem_lag1 + log_gdpcap_lag1 + v2x_cspart_lag1 + iccpr_lag1 + conflict_lag1 + log_popsize_lag1 + mandateholder_lag1| cowc + year  | 0 | cowc, data=data)
+summary(m4)
+screenreg(m4)
+### Models only with year FEs
+my_physint <- felm(physint ~ replied_physint_lag1 + fariss_lag1 + v2x_libdem_lag1 + log_gdpcap_lag1 + v2x_cspart_lag1 + iccpr_lag1 + conflict_lag1 + log_popsize_lag1 + mandateholder_lag1| year  | 0 | cowc, data=data)
+summary(my_physint)
+screenreg(my_physint)
+
+# Environment
+### Models with Country FEs
+mc_environ <- felm(environ ~ replied_environ_lag1 + fariss_lag1 + v2x_libdem_lag1 + log_gdpcap_lag1 + v2x_cspart_lag1 + iccpr_lag1 + conflict_lag1 + log_popsize_lag1 + mandateholder_lag1| cowc | 0 | cowc, data=data)
+summary(mc_environ)
+screenreg(mc_environ)
+### Models with twoway FEs
+m4<- felm(environ ~ replied_environ_lag1 + fariss_lag1 + v2x_libdem_lag1 + log_gdpcap_lag1 + v2x_cspart_lag1 + iccpr_lag1 + conflict_lag1 + log_popsize_lag1 + mandateholder_lag1| cowc + year  | 0 | cowc, data=data)
+summary(m4)
+screenreg(m4)
+### Models only with year FEs
+my_environ <- felm(environ ~ replied_environ_lag1 + fariss_lag1 + v2x_libdem_lag1 + log_gdpcap_lag1 + v2x_cspart_lag1 + iccpr_lag1 + conflict_lag1 + log_popsize_lag1 + mandateholder_lag1| year  | 0 | cowc, data=data)
+summary(my_environ)
+screenreg(my_environ)
+
+# Report results of Year FE models
+stargazer(my_ecosoc, my_civpol, my_physint, my_environ
+          , out = "mandate-specific-models.tex", type="latex"
+          , digits=3, font.size="scriptsize"
+          , notes.align ="l", notes= "Cluster-robust standard errors", notes.append = T
+          , dep.var.labels.include	= F
+          , column.labels = c("EcoSoc OLs", "CivPol OLs", "PhysInt OLs", "Environ OLs")
+          , add.lines = list(c("Year FEs", "🗸", "🗸", "🗸", "🗸"), c("Country FEs", "×", "×", "×", "×"))
+          , column.sep.width = "1pt", model.numbers=F, table.placement="H")
+
+
+# Report results of Country FE models
+stargazer(mc_ecosoc, mc_civpol, mc_physint, mc_environ
+          , out = "mandate-specific-models-countryFEs.tex", type="latex"
+          , digits=3, font.size="scriptsize"
+          , notes.align ="l", notes= "Cluster-robust standard errors", notes.append = T
+          , dep.var.labels.include	= F
+          , column.labels = c("EcoSoc OLs", "CivPol OLs", "PhysInt OLs", "Environ OLs")
+          , add.lines = list(c("Year FEs", "×", "×", "×", "×"), c("Country FEs", "🗸", "🗸", "🗸", "🗸"))
+          , column.sep.width = "1pt", model.numbers=F, table.placement="H")
+
+
+```
+
+
+```{r}
+#### Model state replies ####
+
+# Selection stage 1: who receives an OL
+# Selection stage 2: who replies
+
+# Create binary version of OL variable
+data$other_letters_binary <- ifelse(data$other_letters > 0, 1, 0)
+
+# New analysisdata
+analysisvars <- dplyr::select(data, other_letters, other_letters_binary, replied, fariss_lag1, v2x_cspart_lag1, v2x_libdem_lag1, log_gdpcap_lag1, iccpr_lag1, conflict_lag1, mandateholder_lag1, log_popsize_lag1, year, cowc, country)
+analysisdata <- analysisvars[complete.cases(analysisvars), ]
+analysisdata <- as.data.frame(analysisdata)
+
+
+# Heckman model
+heckmodel <- selection(other_letters_binary ~ fariss_lag1 + v2x_libdem_lag1 + log_gdpcap_lag1 + v2x_cspart_lag1 + iccpr_lag1 + conflict_lag1 + log_popsize_lag1 + mandateholder_lag1, replied ~ fariss_lag1 + v2x_libdem_lag1 + log_gdpcap_lag1 + v2x_cspart_lag1 + iccpr_lag1 + conflict_lag1 + log_popsize_lag1, data = analysisdata) 
+screenreg(heckmodel)
+heckmodel_s <- heckmodel
+heckmodel_s$param$index$betaO <- heckmodel$param$index$betaS
+heckmodel_s$param$index$betaS <- heckmodel$param$index$betaO
+
+
+# Report results
+stargazer(heckmodel, heckmodel_s  , selection.equation = T, column.labels = c("Selection equation", "Outcome equation") , type="latex", digits=3, font.size="scriptsize", notes.align ="l", notes= "Cluster-robust standard errors", notes.append = T, column.sep.width = "1pt", table.placement="H")
+
+
+
+```
+
+```{r}
+#### Check correlates of OLs with direct impact ####
+
+# Read in data on all OLs by the SR on Freedom of Opinion & Expression that received replies
+opinion_dat <- read.csv2("opinion_replied.csv")
+
+# Prepare data
+opinion_dat <- dplyr::select(opinion_dat, -X)
+opinion_dat$year <- sub(".*/", "", opinion_dat$ref_no)
+opinion_dat$year <- as.numeric(opinion_dat$year)
+opinion_dat$cowc <- countrycode(opinion_dat$Country, "country.name", "cowc") 
+opinion_dat$cowc_year <- paste(opinion_dat$cowc, "_", opinion_dat$year)
+
+# Left_join covariates from OL dataset
+nodup <- data[!duplicated(data$cowc_year), ]
+opinion_dat <- left_join(opinion_dat, nodup, by = "cowc_year")
+opinion_dat$v2x_libdem <- as.numeric(opinion_dat$v2x_libdem)
+
+# Check correlations
+cor(opinion_dat$response, opinion_dat$v2x_libdem, use="complete.obs") # r = 0.2
+
+```
+
+
+```{r}
+#### Model effectiveness for Freedom of expression ####
+
+# Create vector with controls for cross-country models
+controls <- paste0("+ fariss_lag1 + v2x_libdem_lag1 + log_gdpcap_lag1 + v2x_cspart_lag1 +  iccpr_lag1 + conflict_lag1 + log_popsize_lag1 + mandateholder_lag1")
+
+# Outcome Freedom of Expression Index
+## Pooled
+f1a <- as.formula( paste0("v2x_freexp ~  opinion_lag1",  " | cowc | 0 | cowc"))
+model1a <- felm(formula = f1a,
+                 data = data)
+## Pooled + controls
+f1b <- as.formula( paste0("v2x_freexp ~  opinion_lag1", controls, " | 0 | 0 | cowc"))
+model1b <- felm(formula = f1b,
+                 data = data)
+## Country FEs + controls
+f1c <- as.formula( paste0("v2x_freexp ~  opinion_lag1", controls, " | cowc | 0 | cowc"))
+model1c <- felm(formula = f1c,
+                 data = data)
+## Dynamic (with lagged DV) + controls
+f1d <- as.formula( paste0("v2x_freexp ~  opinion_lag1", controls, " | + v2x_freexp_lag1 | 0 | cowc"))
+model1d <- felm(formula = f1d,
+                 data = data)
+## Country FEs + Dynamic (with instrumented lagged DV) controls
+f1e <- as.formula( paste0("v2x_freexp ~  opinion_lag1", controls, " | cowc | (v2x_freexp_lag1 ~ v2x_freexp_lag2 + v2x_freexp_lag3 ) | cowc"))
+model1e <- felm(formula = f1e,
+                 data = data)
+
+# Report results
+stargazer(model1a, model1b, model1c, model1d
+          , out = "opinion_effects.tex", type="latex"
+          , digits=3, font.size="scriptsize"
+          , notes.align ="l", notes= "Cluster-robust standard errors", notes.append = T
+          , column.labels = c("Pooled", "Pooled + ctrls","FE", "Dynamic", "FE + dynamic")
+          , dep.var.labels.include	= F, dep.var.caption="Dependent variable: Freedom of Expression Index"
+          , column.sep.width = "1pt", model.numbers=F, table.placement="H")
+
+
+# Outcome Freedom of Discussion
+## Pooled
+f1a <- as.formula( paste0("v2cldiscm ~  opinion_lag1",  " | 0 | 0 | cowc"))
+model1a <- felm(formula = f1a,
+                 data = data)
+## Pooled + controls
+f1b <- as.formula( paste0("v2cldiscm ~  opinion_lag1", controls, " | 0 | 0 | cowc"))
+model1b <- felm(formula = f1b,
+                 data = data)
+## Country FEs + controls
+f1c <- as.formula( paste0("v2cldiscm ~  opinion_lag1", controls, " | cowc | 0 | cowc"))
+model1c <- felm(formula = f1c,
+                 data = data)
+## Dynamic (with lagged DV) + controls
+f1d <- as.formula( paste0("v2cldiscm ~  opinion_lag1", controls, " | + v2cldiscm_lag1 | 0 | cowc"))
+model1d <- felm(formula = f1d,
+                 data = data)
+## Country FEs + Dynamic (with instrumented lagged DV) controls
+f1e <- as.formula( paste0("v2cldiscm ~  opinion_lag1", controls, " | cowc | (v2cldiscm_lag1 ~ v2cldiscm_lag2 + v2cldiscm_lag3 ) | cowc"))
+model1e <- felm(formula = f1e,
+                 data = data)
+
+# Report results
+stargazer(model1a, model1b, model1c, model1d, model1e
+          , out = "opinion_effects.tex", type="latex"
+          , digits=3, font.size="scriptsize"
+          , notes.align ="l", notes= "Cluster-robust standard errors", notes.append = T
+          , column.labels = c("Pooled", "Pooled + ctrls","FE", "Dynamic", "FE + dynamic")
+          , dep.var.labels.include	= F, dep.var.caption="Dependent variable: Freedom of discussion"
+          , column.sep.width = "1pt", model.numbers=F, table.placement="H")
+
+
+
+# Freedom Expression and Alternative Source of Information Index
+## Pooled
+f1a <- as.formula( paste0("v2x_freexp_altinf ~  opinion_lag1",  " | 0 | 0 | cowc"))
+model1a <- felm(formula = f1a,
+                 data = data)
+## Pooled + controls
+f1b <- as.formula( paste0("v2x_freexp_altinf ~  opinion_lag1", controls, " | 0 | 0 | cowc"))
+model1b <- felm(formula = f1b,
+                 data = data)
+## Country FEs + controls
+f1c <- as.formula( paste0("v2x_freexp_altinf ~  opinion_lag1", controls, " | cowc | 0 | cowc"))
+model1c <- felm(formula = f1c,
+                 data = data)
+## Dynamic (with lagged DV) + controls
+f1d <- as.formula( paste0("v2x_freexp_altinf ~  opinion_lag1", controls, " | + v2x_freexp_altinf_lag1 | 0 | cowc"))
+model1d <- felm(formula = f1d,
+                 data = data)
+## Country FEs + Dynamic (with instrumented lagged DV) controls
+f1e <- as.formula( paste0("v2x_freexp_altinf ~  opinion_lag1", controls, " | cowc | (v2x_freexp_altinf_lag1 ~ v2x_freexp_altinf_lag2 + v2x_freexp_altinf_lag3 ) | cowc"))
+model1e <- felm(formula = f1e,
+                 data = data)
+
+# Report results
+stargazer(model1a, model1b, model1c, model1d, model1e
+          , out = "opinion_effects.tex", type="latex"
+          , digits=3, font.size="scriptsize"
+          , notes.align ="l", notes= "Cluster-robust standard errors", notes.append = T
+          , column.labels = c("Pooled", "Pooled + ctrls","FE", "Dynamic", "FE + dynamic")
+          , dep.var.labels.include	= F, dep.var.caption="Dependent variable: Freedom of discussion"
+          , column.sep.width = "1pt", model.numbers=F, table.placement="H")
+
+
+# Government Censorship Effort
+## Pooled
+f1a <- as.formula( paste0("v2mecenefm ~  opinion_lag1",  " | 0 | 0 | cowc"))
+model1a <- felm(formula = f1a,
+                 data = data)
+## Pooled + controls
+f1b <- as.formula( paste0("v2mecenefm ~  opinion_lag1", controls, " | 0 | 0 | cowc"))
+model1b <- felm(formula = f1b,
+                 data = data)
+## Country FEs + controls
+f1c <- as.formula( paste0("v2mecenefm ~  opinion_lag1", controls, " | cowc | 0 | cowc"))
+model1c <- felm(formula = f1c,
+                 data = data)
+## Dynamic (with lagged DV) + controls
+f1d <- as.formula( paste0("v2mecenefm ~  opinion_lag1", controls, " | + v2mecenefm_lag1 | 0 | cowc"))
+model1d <- felm(formula = f1d,
+                 data = data)
+## Country FEs + Dynamic (with instrumented lagged DV) controls
+f1e <- as.formula( paste0("v2mecenefm ~  opinion_lag1", controls, " | cowc | (v2mecenefm_lag1 ~ v2mecenefm_lag2 + v2mecenefm_lag3 ) | cowc"))
+model1e <- felm(formula = f1e,
+                 data = data)
+
+# Report results
+stargazer(model1a, model1b, model1c, model1d, model1e
+          , out = "opinion_effects.tex", type="latex"
+          , digits=3, font.size="scriptsize"
+          , notes.align ="l", notes= "Cluster-robust standard errors", notes.append = T
+          , column.labels = c("Pooled", "Pooled + ctrls","FE", "Dynamic", "FE + dynamic")
+          , dep.var.labels.include	= F, dep.var.caption="Dependent variable: Freedom of discussion"
+          , column.sep.width = "1pt", model.numbers=F, table.placement="H")
+
+
+# Controls without fariss
+controls <- paste0("+ v2x_libdem_lag1 + log_gdpcap_lag1 + v2x_cspart_lag1 +  iccpr_lag1 + conflict_lag1 + log_popsize_lag1 + mandateholder_lag1")
+
+# Physical Integrity Rights Abuse
+data <- data %>% group_by(cowc) %>% arrange(cowc,year) %>% 
+  mutate(fariss_lag2 = lag(theta_mean, 2))
+data <- data %>% group_by(cowc) %>% arrange(cowc,year) %>% 
+  mutate(fariss_lag3 = lag(theta_mean, 3))
+## Pooled
+f1a <- as.formula( paste0("theta_mean ~  physint_lag1",  " | 0 | 0 | cowc"))
+model1a <- felm(formula = f1a,
+                 data = data)
+## Pooled + controls
+f1b <- as.formula( paste0("theta_mean ~  physint_lag1", controls, " | 0 | 0 | cowc"))
+model1b <- felm(formula = f1b,
+                 data = data)
+## Country FEs + controls
+f1c <- as.formula( paste0("theta_mean ~  physint_lag1", controls, " | cowc | 0 | cowc"))
+model1c <- felm(formula = f1c,
+                 data = data)
+## Dynamic (with lagged DV) + controls
+f1d <- as.formula( paste0("theta_mean ~  physint_lag1", controls, " | + fariss_lag1 | 0 | cowc"))
+model1d <- felm(formula = f1d,
+                 data = data)
+## Country FEs + Dynamic (with instrumented lagged DV) controls
+f1e <- as.formula( paste0("theta_mean ~  physint_lag1", controls, " | cowc | (fariss_lag1 ~ fariss_lag2 + fariss_lag3 ) | cowc"))
+model1e <- felm(formula = f1e,
+                 data = data)
+
+# Report results
+stargazer(model1a, model1b, model1c, model1d, model1e
+          , out = "opinion_effects.tex", type="latex"
+          , digits=3, font.size="scriptsize"
+          , notes.align ="l", notes= "Cluster-robust standard errors", notes.append = T
+          , column.labels = c("Pooled", "Pooled + ctrls","FE", "Dynamic", "FE + dynamic")
+          , dep.var.labels.include	= F, dep.var.caption="Dependent variable: Freedom of discussion"
+          , column.sep.width = "1pt", model.numbers=F, table.placement="H")
+
+
+
+
+```
+
+```{r}
+
+```
+
